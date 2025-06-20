@@ -65,8 +65,8 @@ app.MapPost("/api/notifications", async (NotificationRequest request, AppDbConte
         return Results.BadRequest("User not found");
     }
 
-    // Send notification via SignalR to specific user
-    await hubContext.Clients.User(request.UserId.ToString())
+    // Send notification via SignalR to specific user group
+    await hubContext.Clients.Group($"User_{request.UserId}")
         .SendAsync("ReceiveNotification", new
         {
             Id = notification.Id,
