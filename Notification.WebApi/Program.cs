@@ -65,7 +65,7 @@ app.MapPost("/api/notifications", async (NotificationRequest request, AppDbConte
         return Results.BadRequest("User not found");
     }
 
-    // Send notification via SignalR to specific user group
+    // Send notification via SignalR to specific user group (real-time delivery)
     await hubContext.Clients.Group($"User_{request.UserId}")
         .SendAsync("ReceiveNotification", new
         {
@@ -74,17 +74,8 @@ app.MapPost("/api/notifications", async (NotificationRequest request, AppDbConte
             CreatedAt = notification.CreatedAt
         });
 
-    // Mark notification as sent
-    var userNotification = new UserNotification
-    {
-        UserId = request.UserId,
-        NotificationId = notification.Id,
-        IsSent = true,
-        SentAt = DateTime.UtcNow
-    };
-
-    context.UserNotifications.Add(userNotification);
-    await context.SaveChangesAsync();
+    // Note: We don't mark as sent here anymore since that's handled when user connects
+    // Real-time notifications are delivered immediately, offline notifications are handled on connect
 
     return Results.Created($"/api/notifications/{notification.Id}", notification);
 });
@@ -188,9 +179,12 @@ public class NotificationHub : Hub
         // Add connection to user-specific group
         await Groups.AddToGroupAsync(Context.ConnectionId, $"User_{userId}");
 
-        // Send existing unread notifications when user connects
-        var notifications = await _context.Notifications
-            .Where(n => n.UserId == int.Parse(userId))
+        var userIdInt = int.Parse(userId);
+
+        // Get notifications that haven't been sent to this user
+        var unsentNotifications = await _context.Notifications
+            .Where(n => n.UserId == userIdInt &&
+                       !_context.UserNotifications.Any(un => un.NotificationId == n.Id && un.UserId == userIdInt && un.IsSent))
             .OrderByDescending(n => n.CreatedAt)
             .Take(50) // Limit to last 50 notifications
             .Select(n => new
@@ -201,7 +195,27 @@ public class NotificationHub : Hub
             })
             .ToListAsync();
 
-        await Clients.Caller.SendAsync("LoadExistingNotifications", notifications);
+        // Send unsent notifications to the user
+        await Clients.Caller.SendAsync("LoadExistingNotifications", unsentNotifications);
+
+        // Mark these notifications as sent
+        foreach (var notification in unsentNotifications)
+        {
+            var userNotification = new UserNotification
+            {
+                UserId = userIdInt,
+                NotificationId = notification.Id,
+                IsSent = true,
+                SentAt = DateTime.UtcNow
+            };
+
+            _context.UserNotifications.Add(userNotification);
+        }
+
+        if (unsentNotifications.Any())
+        {
+            await _context.SaveChangesAsync();
+        }
     }
 
     public async Task LeaveUserGroup(string userId)
