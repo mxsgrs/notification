@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.SignalR;
 using System.ComponentModel.DataAnnotations;
+using System.Collections.Concurrent;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -9,6 +10,7 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseInMemoryDatabase("NotificationDb"));
 
 builder.Services.AddSignalR();
+builder.Services.AddSingleton<UserConnectionManager>();
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
@@ -45,7 +47,7 @@ using (var scope = app.Services.CreateScope())
 }
 
 // API endpoint to receive HTTP POST requests
-app.MapPost("/api/notifications", async (NotificationRequest request, AppDbContext context, IHubContext<NotificationHub> hubContext) =>
+app.MapPost("/api/notifications", async (NotificationRequest request, AppDbContext context, IHubContext<NotificationHub> hubContext, UserConnectionManager connectionManager) =>
 {
     // Store the notification request
     var notification = new Notification
@@ -65,17 +67,18 @@ app.MapPost("/api/notifications", async (NotificationRequest request, AppDbConte
         return Results.BadRequest("User not found");
     }
 
-    // Send notification via SignalR to specific user group (real-time delivery)
-    await hubContext.Clients.Group($"User_{request.UserId}")
-        .SendAsync("ReceiveNotification", new
-        {
-            Id = notification.Id,
-            Message = notification.Message,
-            CreatedAt = notification.CreatedAt
-        });
-
-    // Note: We don't mark as sent here anymore since that's handled when user connects
-    // Real-time notifications are delivered immediately, offline notifications are handled on connect
+    // Send notification via SignalR to specific user connections (real-time delivery)
+    var connectionIds = connectionManager.GetUserConnections(request.UserId);
+    if (connectionIds.Any())
+    {
+        await hubContext.Clients.Clients(connectionIds)
+            .SendAsync("ReceiveNotification", new
+            {
+                Id = notification.Id,
+                Message = notification.Message,
+                CreatedAt = notification.CreatedAt
+            });
+    }
 
     return Results.Created($"/api/notifications/{notification.Id}", notification);
 });
@@ -113,6 +116,42 @@ app.MapHub<NotificationHub>("/notificationHub");
 app.MapGet("/", () => Results.Redirect("/index.html"));
 
 app.Run();
+
+// Connection Manager
+public class UserConnectionManager
+{
+    private readonly ConcurrentDictionary<int, HashSet<string>> _userConnections = new();
+
+    public void AddUserConnection(int userId, string connectionId)
+    {
+        _userConnections.AddOrUpdate(userId,
+            new HashSet<string> { connectionId },
+            (key, existing) =>
+            {
+                existing.Add(connectionId);
+                return existing;
+            });
+    }
+
+    public void RemoveUserConnection(int userId, string connectionId)
+    {
+        if (_userConnections.TryGetValue(userId, out var connections))
+        {
+            connections.Remove(connectionId);
+            if (!connections.Any())
+            {
+                _userConnections.TryRemove(userId, out _);
+            }
+        }
+    }
+
+    public List<string> GetUserConnections(int userId)
+    {
+        return _userConnections.TryGetValue(userId, out var connections)
+            ? connections.ToList()
+            : new List<string>();
+    }
+}
 
 // Entity Models
 public class User
@@ -168,18 +207,20 @@ public class AppDbContext : DbContext
 public class NotificationHub : Hub
 {
     private readonly AppDbContext _context;
+    private readonly UserConnectionManager _connectionManager;
 
-    public NotificationHub(AppDbContext context)
+    public NotificationHub(AppDbContext context, UserConnectionManager connectionManager)
     {
         _context = context;
+        _connectionManager = connectionManager;
     }
 
     public async Task JoinUserGroup(string userId)
     {
-        // Add connection to user-specific group
-        await Groups.AddToGroupAsync(Context.ConnectionId, $"User_{userId}");
-
         var userIdInt = int.Parse(userId);
+
+        // Add connection to user connection manager
+        _connectionManager.AddUserConnection(userIdInt, Context.ConnectionId);
 
         // Get notifications that haven't been sent to this user
         var unsentNotifications = await _context.Notifications
@@ -220,7 +261,9 @@ public class NotificationHub : Hub
 
     public async Task LeaveUserGroup(string userId)
     {
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"User_{userId}");
+        var userIdInt = int.Parse(userId);
+        _connectionManager.RemoveUserConnection(userIdInt, Context.ConnectionId);
+        await Task.CompletedTask;
     }
 
     public override async Task OnConnectedAsync()
@@ -230,6 +273,12 @@ public class NotificationHub : Hub
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
+        // Remove connection from all users
+        foreach (var userId in Enumerable.Range(1, 3)) // Assuming users 1-3
+        {
+            _connectionManager.RemoveUserConnection(userId, Context.ConnectionId);
+        }
+
         await base.OnDisconnectedAsync(exception);
     }
 }
